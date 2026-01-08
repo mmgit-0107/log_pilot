@@ -1,0 +1,107 @@
+version: '3.8'
+
+services:
+  # 1. Local LLM Service (The Brain)
+  llm-service:
+    image: ollama/ollama:latest
+    container_name: log-pilot-llm
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # Entrypoint script to pull model if missing
+    entrypoint: /bin/sh
+    command: -c "ollama serve & sleep 5 && ollama pull llama3 && wait"
+    networks:
+      - pilot-net
+
+  # 2. Ingestion Worker (Data Plane)
+  ingestion-worker:
+    build:
+      context: .
+      dockerfile: services/ingestion-worker/Dockerfile
+    container_name: log-pilot-ingestion
+    volumes:
+      - ./data/source:/app/data/source
+      - duckdb_data:/app/data/target
+      - ./config:/app/config
+    depends_on:
+      - llm-service
+    networks:
+      - pilot-net
+
+  # 3. Pilot Orchestrator (Control Plane)
+  pilot-orchestrator:
+    build:
+      context: .
+      dockerfile: services/pilot_orchestrator/Dockerfile
+    container_name: log-pilot-brain
+    volumes:
+      - duckdb_data:/app/data/target
+      - ./config:/app/config
+      - ./prompts:/app/prompts
+    environment:
+      - LOCAL_API_KEY=dummy
+      - SHADOW_MODEL=shadow-gpt
+    ports:
+      - "8000:8000"
+    depends_on:
+      - llm-service
+    networks:
+      - pilot-net
+
+  # 4. Frontend UI (Web Interface)
+  frontend:
+    build:
+      context: ./services/frontend
+      dockerfile: Dockerfile
+    container_name: log-pilot-ui
+    ports:
+      - "3000:80"
+    networks:
+      - pilot-net
+
+  # 5. MCP Server (Model Context Protocol)
+  mcp-server:
+    build:
+      context: .
+      dockerfile: services/mcp_server/Dockerfile
+    container_name: log-pilot-mcp
+    volumes:
+      - duckdb_data:/app/data/target
+      - ./config:/app/config
+    ports:
+      - "8001:8001"
+    depends_on:
+      - pilot-orchestrator
+    networks:
+      - pilot-net
+
+  # 6. Evaluation Service (Ragas/Metrics)
+  evaluation-service:
+    build:
+      context: .
+      dockerfile: services/evaluation_service/Dockerfile
+    container_name: log-pilot-eval
+    volumes:
+      - duckdb_data:/app/data/target
+      - ./tests/evaluation:/app/tests/evaluation
+    ports:
+      - "8002:8001"
+    environment:
+      - LLM_BASE_URL=http://log-pilot-llm:11434/v1
+      - PILOT_API_URL=http://pilot-orchestrator:8000
+    depends_on:
+      - llm-service
+      - pilot-orchestrator
+    networks:
+      - pilot-net
+
+volumes:
+  ollama_data:
+  duckdb_data:
+
+
+networks:
+  pilot-net:
+    driver: bridge
