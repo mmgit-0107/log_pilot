@@ -16,7 +16,8 @@ graph TD
     end
     
     subgraph "Ingestion Layer"
-        LogFiles[Log Files] --> |Watch| Worker[Ingestion Worker]
+        Generator[Log Generator] --> |Generates| LandingZone[Landing Zone Folder]
+        LandingZone --> |Watch| Worker[Ingestion Worker]
         Worker --> |Write| LogsDB
         Worker --> |Embed| VectorDB
     end
@@ -97,7 +98,63 @@ sequenceDiagram
     end
 ```
 
-## 3. Service Details
+## 3. Detailed Request Workflow (The Brain) 🧠
+
+LogPilot uses **LangGraph** to orchestrate a team of specialized agents. The flow is not linear; it loops and self-corrects based on validation feedback.
+
+### A. The Cognitive Flow
+```mermaid
+stateDiagram-v2
+    state "User Sends Query" as Start
+    state "Send Final Answer" as End
+
+    Start --> Rewrite
+    Rewrite --> Classify
+    
+    state Classify_Decision <<choice>>
+    Classify --> Classify_Decision
+    
+    Classify_Decision --> SQL_Gen: Intent = SQL
+    Classify_Decision --> RAG_Retrieve: Intent = RAG
+    Classify_Decision --> Synthesize: Intent = Ambiguous
+
+    state "SQL Loop" as SQL_Loop {
+        SQL_Gen --> Validate_SQL
+        Validate_SQL --> Execute_SQL: Valid
+        Validate_SQL --> Fix_SQL: Invalid
+        Fix_SQL --> Validate_SQL
+    }
+    
+    state "RAG Loop" as RAG_Loop {
+        RAG_Retrieve --> Verify_Context
+        Verify_Context --> Synthesize: Valid
+        Verify_Context --> Rewrite: Invalid (Feedback)
+    }
+
+    Execute_SQL --> Synthesize
+    
+    Synthesize --> Validate_Answer
+    Validate_Answer --> End: Valid
+    Validate_Answer --> Synthesize: Invalid (Retry)
+```
+
+### B. Agent Inventory
+The system is composed of **10 distinct Nodes (Agents)**, each with a specific responsibility. "LLM" indicates a creative AI step, while "Code" indicates deterministic logic.
+
+| Agent Name | Role | Type | Responsibility |
+| :--- | :--- | :--- | :--- |
+| **1. Query Rewriter** | `rewrite_query` | 🤖 LLM | Transforms raw user input (e.g., "what about errors?") into a standalone, context-aware query using chat history. |
+| **2. Intent Router** | `classify_intent` | 🤖 LLM (CoT) | **Chain of Thought**: Analyzes if query needs *Data* (SQL) or *Knowledge* (RAG) before deciding. Prevents "404=Duration" hallucinations. |
+| **3. SQL Expert** | `generate_sql` | 🤖 LLM | Translates natural language into dialect-specific SQL (DuckDB). Enforces syntax rules. |
+| **4. SQL Critic** | `validate_sql` | ⚙️ Code | Deterministic validation. Checks for syntax (`EXPLAIN`) and **Schema Columns** (injects valid columns on error). |
+| **5. Repair Agent** | `fix_sql` | 🤖 LLM | Receives error logs from the Critic and attempts to fix the SQL syntax. |
+| **6. Tool Executor** | `execute_sql` | ⚙️ Code | Runs the valid SQL against `logs.duckdb` and captures the result (or runtime error). |
+| **7. RAG Retriever** | `retrieve_context` | ⚙️ Code | Queries `ChromaDB` for patterns, then fetches matching full logs from DuckDB. |
+| **8. Context Critic** | `verify_context` | 🤖 LLM | **Strict Verification**: Enforces that if a specific Error Code is queried, the retrieved context *must* contain it. |
+| **9. Answer Synthesize** | `synthesize_answer` | 🤖 LLM | Combines the User Query + Data/Context into a helpful, human-readable response. |
+| **10. QA Critic** | `validate_answer` | 🤖 LLM | Final check. Ensures the answer is not "lazy" (e.g., "I don't know") if data was actually found. |
+
+## 4. Service Details
 
 ### Pilot Orchestrator
 -   **Framework**: FastAPI + LangGraph.
@@ -105,9 +162,16 @@ sequenceDiagram
 -   **State Management**: Uses `langgraph` StateGraph to pass context between nodes.
 -   **Agentic Features**: Self-correction loops for Context and Answer verification.
 
+### Log Generator (Demo Data Source)
+-   **Role**: Creates a realistic 12-month historical dataset on startup.
+-   **Function**: Simulates 4 services (Payment, Auth, DB, Frontend) with random anomalies.
+-   **Output**: Writes logs to `data/source/landing_zone`, then exits.
+
 ### Ingestion Worker
 -   **Role**: Real-time log processing.
--   **Mechanism**: Uses `watchdog` to monitor file system events.
+-   **Mechanism**:
+    -   **File Watcher**: Uses `watchdog` to listen for new files in `landing_zone`.
+    -   **Processing**: Automatically ingests files and moves them to `processed/`.
 -   **PII Masking**: Regex-based masking for emails, IP addresses, and SSNs before storage.
 
 ### Evaluation Service (New)
@@ -119,42 +183,88 @@ sequenceDiagram
 -   **DuckDB**: Chosen for high-performance OLAP queries on local files.
 -   **ChromaDB**: Vector store for RAG (Retrieval Augmented Generation).
 
-## 4. Agentic RAG Deep Dive 🧠
+## 5. Agentic RAG Logic & Fallback Strategy 🧠
 
-LogPilot employs an **Agentic RAG** architecture, moving beyond simple linear chains to a cyclic, self-correcting graph.
+The **RAG (Retrieval Augmented Generation)** pipeline is designed for **qualitative** questions—when you need to know "Why", "How", or "Who", rather than "How many".
 
-### The "Router-Solver" Pattern
-The system first classifies the user's intent to select the best tool:
-1.  **SQL Solver**: For quantitative questions ("How many...", "Trend of...").
-2.  **RAG Solver**: For qualitative questions ("How to fix...", "What is...").
+### A. The Trigger Logic
+The **Intent Router** selects the `rag` path when the query implies causality, identity, or procedure.
+*   **Keywords**: "Why", "How to", "Who owns", "Runbook".
+*   **Examples**:
+    *   *"Why is the payment service failing?"* (RAG 🟢)
+    *   *"Count errors in the last hour."* (SQL 🔴)
 
-### Self-Correction Loops
-Unlike standard RAG, LogPilot verifies its own work before responding:
+### B. The Logic Pipeline (Hybrid Search)
+If RAG is selected, we execute a specialized 3-step process:
 
-#### Loop 1: Context Verification (`verify_context`)
-*   **Problem**: RAG often retrieves irrelevant chunks (e.g., old logs, wrong service).
-*   **Solution**: An LLM node checks if the retrieved chunks actually answer the query.
-*   **Action**: If irrelevant, the agent **Rewrites the Query** and retries retrieval.
+1.  **Semantic Pattern Match (ChromaDB)**:
+    *   We embed the query to find abstract **Log Patterns** (e.g., `Payment gateway timed out after <*> ms`).
+    *   We do *not* search raw logs directly, which ensures we find the *type* of error even if the specific timestamp/user ID is different.
 
-#### Loop 2: Answer Validation (`validate_answer`)
-*   **Problem**: LLMs can hallucinate or be lazy ("I don't know" when context is present).
-*   **Solution**: An LLM node compares the generated answer against the original intent and context.
-*   **Action**: If the answer is lazy or hallucinated, the agent **Regenerates** with specific feedback (e.g., "You have the logs in context, please list them.").
+2.  **Structured Data Fetch (DuckDB)**:
+    *   We extract the `template_id` from the matched pattern.
+    *   We query **DuckDB** for the *actual* recent logs that match that ID to get real timestamps and values.
 
-### State Management
-We use `LangGraph` to manage the state:
-```python
-class AgentState(TypedDict):
-    query: str
-    rewritten_query: str
-    rag_context: str
-    context_valid: bool  # Feedback flag
-    final_answer: str
-    answer_valid: bool   # Feedback flag
+3.  **Context Verification (The Critic)**:
+    *   An LLM Critic reads the fetched logs.
+    *   **Logic**: "Does this log actually answer the user's question?"
+    *   **Strict Rule**: If the user asks for "Error 502", the system *must* have found 502.
+    *   **Window Retrieval**: If a match is found, we fetch the surrounding **+/- 30s** of logs to provide causal context (e.g., Timeout -> Error) to the LLM.
+
+### C. The Fallback (Web Search) 🌍
+If the RAG pipeline fails (e.g., no patterns found, or Critic rejects them), the system triggers a **Web Search**:
+1.  **Condition**: User asks a general question ("What is error 503?") OR internal logs are irrelevant.
+2.  **Action**: The `perform_web_search` node queries DuckDuckGo.
+3.  **Result**: The system answers using external documentation instead of internal logs.
+
+### D. Decision Flowchart
+```mermaid
+graph TD
+    Q[User Query] --> Router{Intent?}
+    Router -- "Count/Start/List" --> SQL[SQL Agent]
+    Router -- "Why/How/Who" --> RAG[RAG Agent]
+    
+    subgraph RAG Logic
+        RAG --> Chroma[1. Pattern Match]
+        Chroma --> DuckDB[2. Fetch Logs]
+        DuckDB --> Critic{Relevant?}
+        Critic -- Yes --> Answer[Final Answer]
+        Critic -- No --> Web[3. Web Fallback]
+    end
 ```
-This state is passed between nodes, allowing the agent to "remember" previous failures in the same turn.
 
-## 4. Storage Optimization Strategy
+## 6. Smart Runbook Ingestion (The Reader Agent) 🧠📘
+
+While `drain3` handles structured logs, **Technical Runbooks** (Markdown/PDF) require a different approach. We employ an **AI Reader Agent** to de-fragment and ingest this static knowledge.
+
+### A. The Problem: "Fragmented Knowledge"
+A runbook often mentions "Error 503" in multiple places:
+1.  **Table of Contents**: Lists it.
+2.  **Symptoms Section**: Describes what it looks like.
+3.  **Fix Section**: Describes how to solve it.
+
+Standard **Chunking** (splitting text by 500 characters) fails here. It creates 3 separate, incomplete vectors. If you search "How to fix 503", you might get the symptoms card but not the fix card.
+
+### B. The Solution: "Smart Synthesis"
+The **Ingestion Worker** uses a 2-Pass LLM Strategy:
+
+1.  **Pass 1: Discovery (The Scanner)**
+    *   The Agent scans the document to identify **Key Topics** (e.g., `["Error 503", "Auth Token Expired"]`).
+    *   **New**: It specifically looks for topics inside **Tables** and **Headers** to ensure no error code is missed (e.g., `| 502 | Bad Gateway |`).
+    *   It ignores generic text.
+
+2.  **Pass 2: Synthesis (The Researcher)**
+    *   For *each* topic, the Agent re-reads the *entire* document.
+    *   It extracts all relevant clauses (Symptoms + Cause + Fix) from scattered sections.
+    *   It synthesizes a **Single Knowledge Card**.
+
+### C. The Result: "High-Quality Vectors"
+The Vector DB stores the **Synthesized Card**, not the raw text.
+*   **Query**: "How to fix 503?"
+*   **Retrieved Vector**: A complete mini-guide containing the definition AND the fix.
+*   **Outcome**: The RAG Agent answers correctly with full context.
+
+## 7. Storage Optimization Strategy
 
 The current architecture prioritizes **simplicity and context** for the LLM by storing full log bodies. However, for high-volume production environments, a **Log Normalization** strategy is designed and feasible.
 
@@ -174,7 +284,7 @@ The current architecture prioritizes **simplicity and context** for the LLM by s
 -   **Cons**: Reconstruction overhead, complexity in search (cannot grep raw text).
 -   **Feasibility**: Verified via `tests/check_drain3.py` that `drain3` supports parameter extraction.
 
-## 5. Vector DB Usage Scenarios
+## 8. Vector DB Usage Scenarios
 
 The Vector DB (ChromaDB) is the "Semantic Brain" of LogPilot. It is used when the user's question is **vague, qualitative, or pattern-based**.
 
@@ -203,7 +313,7 @@ The Vector DB (ChromaDB) is the "Semantic Brain" of LogPilot. It is used when th
     2.  **Generate SQL**: `SELECT count(*) FROM logs WHERE severity='ERROR' AND timestamp > now() - INTERVAL 1 HOUR`.
     3.  **Execute**: Runs directly on DuckDB. Vector DB is bypassed completely.
 
-## 6. Production Data Architecture: Stateless on S3
+## 9. Production Data Architecture: Stateless on S3
 
 In our current **Demo/MVP** environment, we ingest logs into a local DuckDB file (`logs.duckdb`). In a **Real-World Production** environment, we recommend a **Stateless Architecture** that queries data directly where it lives (e.g., S3), avoiding data duplication.
 
@@ -248,7 +358,7 @@ To transition LogPilot to this architecture:
 
 This allows LogPilot to become a **Zero-ETL** agent, providing intelligence on top of your existing Data Lake.
 
-## 7. Cloud-Native Adaptation: AWS CloudWatch ☁️
+## 10. Cloud-Native Adaptation: AWS CloudWatch ☁️
 
 For environments where logs are stored in **AWS CloudWatch Logs** (e.g., AWS Glue jobs), we can adapt LogPilot to query them directly without ingestion, acting as a smart UI over the CloudWatch API.
 
@@ -293,7 +403,7 @@ If the user asks a qualitative question ("Why did the job fail?"), we use a **Hy
 
 This approach achieves **Zero Data Duplication** while leveraging LogPilot's agentic capabilities.
 
-## 8. Design Considerations & Trade-offs ⚖️
+## 11. Design Considerations & Trade-offs ⚖️
 
 This section summarizes the key architectural decisions to help stakeholders understand "Why" we built it this way.
 
@@ -320,3 +430,6 @@ This section summarizes the key architectural decisions to help stakeholders und
     *   **Real-Time**: No waiting for ingestion pipelines.
     *   **Cost Savings**: No duplicate storage costs.
     *   **Simplicity**: Fewer moving parts to maintain.
+
+## 12. Future Roadmap & Risks 🔮
+For a detailed breakdown of architectural risks (e.g., Latency, Context Limits) and planned enhancements (S3, CloudWatch Support), please refer to the **[Project Backlog](backlog.md)**.

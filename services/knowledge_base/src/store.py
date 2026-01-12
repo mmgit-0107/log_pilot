@@ -61,11 +61,27 @@ class KnowledgeStore:
         Converts logs to documents and adds them to the index.
         """
         documents = LogConverter.to_documents(logs)
-        # Insert into index
-        # Note: This updates the underlying ChromaDB automatically
+        # Batch Insert Optimization (Fix 2)
+        # Instead of inserting one by one, we parse nodes and insert in batch.
+        # This reduces overhead significantly.
+        try:
+            # Use global Settings to get the parser
+            nodes = Settings.node_parser.get_nodes_from_documents(documents)
+            self.index.insert_nodes(nodes)
+            print(f"✅ Added {len(logs)} logs to Knowledge Base (Batch Insert).")
+        except Exception as e:
+            # Fallback to slower method if batch fails
+            print(f"⚠️ Batch insert failed: {e}. Falling back to iterative.")
+            for doc in documents:
+                self.index.insert(doc)
+
+    def add_documents(self, documents: List[Any]):
+        """
+        Adds generic LlamaIndex Documents to the index.
+        """
         for doc in documents:
             self.index.insert(doc)
-        print(f"✅ Added {len(logs)} logs to Knowledge Base.")
+        print(f"✅ Added {len(documents)} documents to Knowledge Base.")
 
     def delete_older_than(self, timestamp: float):
         """

@@ -9,21 +9,39 @@ from services.pilot_orchestrator.src.state import AgentState
 from shared.llm.client import LLMClient
 from shared.llm.prompt_factory import PromptFactory
 from services.pilot_orchestrator.src.tools.sql_tool import SQLGenerator
+from services.pilot_orchestrator.src.tools.web_search import WebSearchTool
 from services.knowledge_base.src.store import KnowledgeStore
 from shared.db.duckdb_client import DuckDBConnector
+from datetime import datetime, timedelta
+import re
 
 # Initialize Shared Components
 llm_client = LLMClient()
 prompt_factory = PromptFactory()
-sql_tool = SQLGenerator()
-# Lazy load KnowledgeStore to avoid init issues during testing if not needed
+# Lazy load tools to avoid init issues during testing or startup if DB is locked
+_sql_tool = None
 _kb_store = None
+_web_tool = None
+
+def get_sql_tool():
+    global _sql_tool
+    if _sql_tool is None:
+        _sql_tool = SQLGenerator()
+    return _sql_tool
 
 def get_kb_store():
     global _kb_store
     if _kb_store is None:
         _kb_store = KnowledgeStore()
     return _kb_store
+
+def get_web_tool():
+    global _web_tool
+    if _web_tool is None:
+        _web_tool = WebSearchTool()
+    return _web_tool
+
+
 
 
 
@@ -83,11 +101,27 @@ def classify_intent(state: AgentState) -> AgentState:
             "intent_classifier",
             query=query
         )
-        # Use 'fast' model for classification to keep latency low
-        intent = llm_client.generate(prompt, model_type="fast").strip().lower()
+        # Use 'fast' model for classification
+        response = llm_client.generate(prompt, model_type="fast")
         
+        import json
+        import re
+        
+        # Robust JSON extraction
+        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        if json_match:
+            response_json = json.loads(json_match.group(0))
+            intent = response_json.get("intent", "ambiguous").lower()
+            reasoning = response_json.get("reasoning", "No reasoning provided.")
+            print(f"🤔 Intent Reasoning: {reasoning}")
+        else:
+            # Fallback to plain text if JSON fails (backward compatibility/safety)
+            intent = response.strip().lower()
+            print(f"⚠️ Intent Parsing: JSON not found, using raw text: {intent}")
+
         # Validate intent
-        if intent not in ["sql", "rag", "ambiguous"]:
+        valid_intents = ["sql", "rag", "web_search", "ambiguous"]
+        if intent not in valid_intents:
             intent = "ambiguous"
             
         state["intent"] = intent
@@ -95,7 +129,7 @@ def classify_intent(state: AgentState) -> AgentState:
         print(f"❌ Intent Classification Failed: {e}")
         state["intent"] = "ambiguous" # Fail safe
     
-    print(f"🤔 Intent Classified: {state['intent']}")
+    print(f"📍 Final Intent: {state['intent']}")
     return state
 
 def generate_sql(state: AgentState) -> AgentState:
@@ -108,7 +142,7 @@ def generate_sql(state: AgentState) -> AgentState:
     # We no longer need to pass chat_history to generate_sql 
     # because the query is already rewritten!
     try:
-        sql = sql_tool.generate_sql(query)
+        sql = get_sql_tool().generate_sql(query)
         state["sql_query"] = sql
         state["sql_error"] = None # Clear previous errors
     except Exception as e:
@@ -149,6 +183,22 @@ def validate_sql(state: AgentState) -> AgentState:
             state["sql_valid"] = True
             state["sql_error"] = None
             print(f"✅ SQL Validated: {sql}")
+
+        except Exception as e_sql:
+            # 3. Schema Injection for Repair Logic
+            # If validatio fails (e.g. Column not found), we fetch the schema 
+            # and append it to the error so the Repair Agent knows the truth.
+            try:
+                # PRAGMA table_info returns: (cid, name, type, notnull, dflt_value, pk)
+                schema_rows = db.query("PRAGMA table_info(logs)")
+                valid_cols = [row[1] for row in schema_rows]
+                schema_hint = f"\nAvailable Columns in 'logs': {valid_cols}"
+            except Exception as e_schema:
+                schema_hint = f" (Failed to fetch schema: {e_schema})"
+            
+            error_msg = f"{str(e_sql)}{schema_hint}"
+            raise Exception(error_msg)
+
         finally:
             db.close()
     except Exception as e:
@@ -233,53 +283,95 @@ def retrieve_context(state: AgentState) -> AgentState:
             state["rag_context"] = "No relevant log patterns found."
             return state
 
-        # 2. Extract Template IDs
+        # 2. Extract Template IDs and Knowledge Cards
         template_ids = []
         patterns = []
+        knowledge_cards = []
+        
         for node in nodes:
-            # In Ingestion Worker, we stored: context={"cluster_id": ..., "is_pattern": True}
-            # LlamaIndex stores this in node.metadata
+            # Check for Runbook Cards
+            node_type = node.metadata.get("type")
+            if node_type == "runbook_card":
+                topic = node.metadata.get("topic", "General")
+                content = node.get_content()
+                knowledge_cards.append(f"📘 Runbook Card ({topic}):\n{content}")
+                continue
+
+            # Check for Log Patterns
             t_id = node.metadata.get("cluster_id")
             if t_id:
                 template_ids.append(str(t_id))
                 patterns.append(node.get_content())
 
-        if not template_ids:
-             state["rag_context"] = f"Found patterns but no IDs. Patterns: {patterns}"
+        if not template_ids and not knowledge_cards:
+             state["rag_context"] = f"Found patterns/docs but no usable content. Raw: {nodes}"
              return state
 
-        # 3. Query DuckDB for recent logs matching these templates
-        db = DuckDBConnector(read_only=True)
-        try:
-            # Create a parameterized query for IN clause
-            placeholders = ','.join(['?'] * len(template_ids))
-            
-            # We query the 'context' JSON column for the template_id
-            sql = f"""
-                SELECT timestamp, service_name, severity, body 
-                FROM logs 
-                WHERE json_extract_string(context, '$.template_id') IN ({placeholders})
-                ORDER BY timestamp DESC 
-                LIMIT 20
-            """
-            
-            logs = db.query(sql, template_ids)
-            
-            # 4. Synthesize Context
-            context_str = f"Found {len(patterns)} relevant log patterns:\n"
-            for p in patterns:
-                context_str += f"- {p}\n"
-            
-            context_str += f"\nHere are the {len(logs)} most recent log entries matching these patterns:\n"
-            for log in logs:
-                # log is a tuple: (timestamp, service, severity, body)
-                context_str += f"[{log[0]}] {log[1]} ({log[2]}): {log[3]}\n"
+        context_parts = []
+        
+        # Add Knowledge Cards to Context
+        if knowledge_cards:
+            context_parts.append("### 📘 Relevant Documentation:")
+            context_parts.extend(knowledge_cards)
+            context_parts.append("\n")
+
+        # 3. Query DuckDB for ANCHOR matches and fetch WINDOWS
+        if template_ids:
+            try:
+                db = DuckDBConnector(read_only=True)
+                # Create a parameterized query for IN clause
+                placeholders = ','.join(['?'] * len(template_ids))
                 
-            state["rag_context"] = context_str
-            print(f"✅ RAG Retrieved {len(logs)} logs for {len(template_ids)} patterns.")
-            
-        finally:
-            db.close()
+                # Fetch ANCHORS (Limit reduced to 5 to allow for window expansion)
+                sql_anchors = f"""
+                    SELECT timestamp, service_name, severity, body 
+                    FROM logs 
+                    WHERE json_extract_string(context, '$.template_id') IN ({placeholders})
+                    ORDER BY timestamp DESC 
+                    LIMIT 5
+                """
+                
+                anchor_logs = db.query(sql_anchors, template_ids)
+                
+                context_parts.append(f"### 🔍 Found {len(patterns)} relevant log patterns:")
+                for p in patterns:
+                    context_parts.append(f"- {p}")
+                
+                if anchor_logs:
+                    context_parts.append(f"\n### 📋 Log Windows (Causal Context +/- 30s):")
+                    
+                    for i, anchor in enumerate(anchor_logs):
+                        ts = anchor[0]
+                        # DuckDB returns datetime objects
+                        start_time = ts - timedelta(seconds=30)
+                        end_time = ts + timedelta(seconds=30)
+                        
+                        # Fetch Window
+                        sql_window = """
+                            SELECT timestamp, service_name, severity, body 
+                            FROM logs 
+                            WHERE timestamp BETWEEN ? AND ?
+                            ORDER BY timestamp ASC
+                        """
+                        window_logs = db.query(sql_window, [start_time, end_time])
+                        
+                        context_parts.append(f"\n**Window #{i+1} around {ts}**")
+                        for log in window_logs:
+                            # Highlight the anchor log
+                            marker = "📌" if log[0] == ts else "  "
+                            context_parts.append(f"{marker} [{log[0]}] {log[1]} ({log[2]}): {log[3]}")
+                else:
+                    context_parts.append("\nNo recent logs found matching these patterns.")
+
+                db.close()
+                    
+            except Exception as e:
+                print(f"⚠️ Failed to fetch logs for patterns: {e}")
+                context_parts.append(f"Note: Found patterns {template_ids} but failed to fetch recent logs: {e}")
+
+        # Final Context Assembly
+        state["rag_context"] = "\n".join(context_parts)
+        print(f"✅ RAG Context Built: {len(knowledge_cards)} cards, {len(template_ids)} patterns.")
 
     except Exception as e:
         print(f"❌ RAG Retrieval Failed: {e}")
@@ -304,8 +396,14 @@ def synthesize_answer(state: AgentState) -> AgentState:
              context = f"SQL Error: {state['sql_error']}"
     elif intent == "rag":
         context = f"Retrieved Context: {state.get('rag_context')}"
+    elif intent == "web_search":
+        context = f"Web Search Results: {state.get('web_results')}"
     else:
-        context = "Ambiguous intent."
+        # Check if we have web results from fallback
+        if state.get("web_results"):
+             context = f"Web Search Results (Fallback): {state.get('web_results')}"
+        else:
+             context = "Ambiguous intent."
 
     # Format Chat History (still useful for tone/continuity)
     messages = state.get("messages", [])
@@ -403,11 +501,12 @@ def verify_context(state: AgentState) -> AgentState:
         response = llm_client.generate(prompt, model_type="fast")
         
         import json
-        # Extract JSON
-        if "```json" in response:
-            response = response.split("```json")[1].split("```")[0].strip()
-        elif "```" in response:
-            response = response.split("```")[1].strip()
+        import re
+        
+        # Robust JSON extraction
+        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        if json_match:
+             response = json_match.group(0)
             
         result = json.loads(response)
         state["context_valid"] = result.get("valid", False)
@@ -417,7 +516,11 @@ def verify_context(state: AgentState) -> AgentState:
         
     except Exception as e:
         print(f"❌ Context Verification Failed: {e}")
-        state["context_valid"] = True # Fail open to avoid blocking
+        # FAIL SAFE: Determine if we should fail open or closed.
+        # If verification fails (e.g. LLM garbage), we risk hallucination if we proceed.
+        # Safer to assume invalid and trigger Web Search fallback.
+        state["context_valid"] = False 
+        state["context_feedback"] = f"Verification system error: {e}"
         
     return state
 
@@ -452,5 +555,23 @@ def validate_answer(state: AgentState) -> AgentState:
     except Exception as e:
         print(f"❌ Answer Validation Failed: {e}")
         state["answer_valid"] = True # Fail open
+        
+    return state
+
+def perform_web_search(state: AgentState) -> AgentState:
+    """
+    Performs a web search using the rewritten query.
+    This acts as a fallback for RAG or for general questions.
+    """
+    query = state.get("rewritten_query", state["query"])
+    print(f"🌍 Performing Web Search for: {query}")
+    
+    try:
+        results = get_web_tool().search(query)
+        state["web_results"] = results
+        print("✅ Web Search Completed.")
+    except Exception as e:
+        print(f"❌ Web Search Failed: {e}")
+        state["web_results"] = "Web search failed."
         
     return state

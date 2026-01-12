@@ -10,10 +10,13 @@ class AgentState(TypedDict):
     # SQL Path
     sql_query: Optional[str]
     sql_result: Optional[str]
+    sql_valid: Optional[bool]
     sql_error: Optional[str]
     
     # RAG Path
+    # RAG Path
     rag_context: Optional[str]
+    web_results: Optional[str]
     
     # Final Output
     final_answer: Optional[str]
