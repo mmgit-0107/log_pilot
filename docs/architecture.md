@@ -31,6 +31,11 @@ graph TD
         Eval <--> |Judge| LLM
         Eval --> |Store| MetricsDB[(metrics.duckdb)]
     end
+
+    subgraph "Monitoring Layer"
+        Sentry[Sentry Service] --> |Monitor| LogsDB
+        Sentry --> |Alert| HistoryDB
+    end
 ```
 
 ## 2. Sequence Diagrams
@@ -97,6 +102,32 @@ sequenceDiagram
         PII->>Chroma: Embed & Store
     end
 ```
+
+### C. Proactive Alert Flow (Sentry)
+
+```mermaid
+sequenceDiagram
+    participant S as Sentry Service
+    participant Logs as LogsDB
+    participant Hist as HistoryDB
+    participant UI as Frontend
+
+    loop Every Minute
+        S->>Logs: Check Error Rate (Current vs Baseline)
+        
+        alt Spike Detected
+            S->>S: Analyze Severity
+            S->>Hist: Insert Alert Record
+            
+            loop UI Polling
+                UI->>Hist: Check for new Alerts
+                Hist-->>UI: Return Alert Data
+                UI->>UI: Show Notification Badge
+            end
+        end
+    end
+```
+
 
 ## 3. Detailed Request Workflow (The Brain) 🧠
 
@@ -178,6 +209,13 @@ The system is composed of **10 distinct Nodes (Agents)**, each with a specific r
 -   **Role**: Offline performance measurement.
 -   **Stack**: FastAPI + Ragas.
 -   **Function**: Runs the `golden_dataset.json` against the Pilot and scores results using an LLM Judge.
+
+### Sentry Service (New) 🛡️
+-   **Role**: Proactive background monitoring.
+-   **Mechanism**:
+    -   **Anomaly Detection**: Compares current log error rates against a rolling baseline.
+    -   **Alerting**: Writes alerts to `history.duckdb` for the Frontend to consume.
+    -   **Independence**: Runs as a standalone process/thread, ensuring monitoring continues even if the UI is closed.
 
 ### Database Layer
 -   **DuckDB**: Chosen for high-performance OLAP queries on local files.
@@ -388,7 +426,6 @@ Q: "Show me the last 20 errors"
 A: fields @timestamp, @message | filter @message like /ERROR/ | sort @timestamp desc | limit 20
 ```
 
-#### 2. CloudWatch Connector (The "Executor")
 #### 2. CloudWatch Connector (The "Executor")
 We implement a connector using the **AWS SDK (Boto3)** to execute the generated query. This connector is responsible for:
 1.  **Initiating Queries**: Sending the `start_query` request to the CloudWatch Logs API.
